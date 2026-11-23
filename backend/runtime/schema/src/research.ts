@@ -16,14 +16,6 @@ export const Binding = Schema.Struct({
 }).annotate({ identifier: "Research.Binding" })
 export interface Binding extends Schema.Schema.Type<typeof Binding> {}
 
-// Legacy terminal labels; the service discovers current list names from the catalog.
-export const labels: Readonly<Record<number, string>> = {
-  49: "Student master list",
-  91: "Confirmed deaths",
-  93: "Additional Deaths",
-  94: "Potential",
-}
-
 export const Operator = Schema.Literals([
   "EQUALS",
   "NOT_EQUALS",

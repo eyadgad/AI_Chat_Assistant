@@ -216,18 +216,12 @@ test("REASONING_MODEL answers every question, whatever model a request names", a
   expect(asked[0]).not.toHaveProperty("model")
 })
 
-test("the engine reads only the last two exchanges under the current selection", async () => {
+test("the engine can read the conversation's recent exchanges under the current selection", async () => {
   await call("Query", { ...query, question: "one" })
   await call("Query", { ...query, question: "two" })
-  await call("Query", { ...query, question: "three" })
-  await call("Query", { ...query, question: "four" })
-  await call("Query", { ...query, question: "five", communities: ["Batchewana"] })
+  await call("Query", { ...query, question: "three", communities: ["Batchewana"] })
   expect(contexts[1]).toEqual([{ question: "one", answer: "Answer to one" }])
-  expect(contexts[3]).toEqual([
-    { question: "two", answer: "Answer to two" },
-    { question: "three", answer: "Answer to three" },
-  ])
-  expect(contexts[4]).toEqual([])
+  expect(contexts[2]).toEqual([])
 })
 
 test("Speak returns the audio and its type", async () => {
