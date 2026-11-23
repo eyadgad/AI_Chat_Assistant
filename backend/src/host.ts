@@ -5,6 +5,7 @@ import path from "node:path"
 import { Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { Research } from "@opencode/schema/research"
 import { Session } from "@opencode/schema/session"
+import { SessionEvent } from "@opencode/schema/session-event"
 import { ResearchResponse } from "./research-response.js"
 import { Agent } from "@opencode/schema/agent"
 import { Model } from "@opencode/schema/model"
@@ -17,6 +18,7 @@ import { ResearchState } from "./research/state"
 import { ResearchPlugin } from "./plugin/research"
 import { Global } from "@opencode/util/global"
 import { SessionRestart } from "@opencode/core/session/execution/restart"
+import { Bus } from "@opencode/core/bus"
 import { EmbeddedHost } from "@opencode/sdk/embedded"
 
 export interface Options {
@@ -28,7 +30,10 @@ export interface Options {
   readonly allowedProviders: readonly string[]
 }
 
-export type Progress = { readonly type: "working" | "tool" | "finished"; readonly tool?: string }
+export type Progress =
+  | { readonly type: "working" | "tool" | "finished"; readonly tool?: string }
+  /** Live reply text. `reset` means earlier streamed text belongs to a finished step the final reply drops. */
+  | { readonly type: "text"; readonly delta: string; readonly reset: boolean }
 
 export async function create(options: Options) {
   const directory = path.resolve(options.directory)
@@ -113,10 +118,11 @@ export async function create(options: Options) {
       }
       const active = new Set<string>()
       return {
+        /** The lists this principal may open, as public.data_config and the dataset policy define them. */
+        lists: () => connection.lists(),
         catalog: async () => {
-          const results = await Promise.allSettled(
-            Schema.Literals([49, 91, 93, 94]).literals.map((id) => connection.catalog(id)),
-          )
+          const lists = await connection.lists()
+          const results = await Promise.allSettled(lists.map((list) => connection.catalog(list.fileID)))
           const failed = results.find(
             (result) => result.status === "rejected" && !(result.reason instanceof ResearchDatabase.AccessDeniedError),
           )
@@ -124,10 +130,20 @@ export async function create(options: Options) {
             throw new Error("Research catalog unavailable; verify the database connection and gateway")
           return results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
         },
-        create: async (fileID: Research.FileID, id?: string) => {
+        /** One list's catalog entry, or undefined when it is not a research list or this principal may not open it. */
+        dataset: async (fileID: number) => {
+          const selected = Schema.decodeUnknownOption(Research.FileID)(fileID)
+          if (selected._tag === "None") return undefined
+          return connection.catalog(selected.value).catch((error: unknown) => {
+            if (error instanceof ResearchDatabase.AccessDeniedError) return undefined
+            throw error
+          })
+        },
+        /** `communities`, when given, limits the Session to records of those communities for its lifetime. */
+        create: async (fileID: number, id?: string, communities: readonly string[] = []) => {
           const selected = Schema.decodeUnknownSync(Research.FileID)(fileID)
           const dataset = await connection.catalog(selected)
-          return host.runtime.runPromise(
+          const session = await host.runtime.runPromise(
             host.sessions.create({
               id: id ? Session.ID.make(id) : undefined,
               research: { database: connection.identity, fileID: selected, principal: connection.principal },
@@ -137,6 +153,13 @@ export async function create(options: Options) {
               title: dataset.label,
             }),
           )
+          if (!communities.length) return session
+          // A Session must never answer without its limit, so one that cannot store it is removed.
+          await host.runtime.runPromise(state.scope(session.id, communities)).catch(async (error: unknown) => {
+            await host.runtime.runPromise(host.sessions.remove(session.id)).catch(() => undefined)
+            throw error
+          })
+          return session
         },
         get: requireSession,
         list: async () =>
@@ -158,8 +181,10 @@ export async function create(options: Options) {
             throw new Error("Source evidence is stale; replay the query against the latest publication")
           return evidence
         },
-        prompt: async (sessionID: string, text: string, progress?: (event: Progress) => void) => {
+        prompt: async (sessionID: string, text: string, progress?: (event: Progress) => void, signal?: AbortSignal) => {
+          signal?.throwIfAborted()
           await requireSession(sessionID)
+          signal?.throwIfAborted()
           if (active.has(sessionID)) throw new Error("This Session is already answering a question")
           if (!text.trim() || text.length > 16000) throw new Error("Enter a question of 1–16000 characters")
           active.add(sessionID)
@@ -168,6 +193,12 @@ export async function create(options: Options) {
             const admitted = await host.runtime.runPromise(
               host.sessions.prompt({ sessionID: Session.ID.make(sessionID), text, resume: false }),
             )
+            if (signal?.aborted) {
+              await host.runtime.runPromise(
+                host.sessions.cancelInbox({ sessionID: Session.ID.make(sessionID), inboxID: admitted.id }),
+              )
+              signal.throwIfAborted()
+            }
             const watch = host.runtime.runFork(
               host.sessions.log({ sessionID: Session.ID.make(sessionID), follow: true }).pipe(
                 Stream.runForEach((event) =>
@@ -189,9 +220,48 @@ export async function create(options: Options) {
                 ),
               ),
             )
+            // Text deltas are ephemeral, so they never reach the durable log above; take them from the live bus.
+            let boundary = false
+            const live = host.runtime.runFork(
+              Effect.gen(function* () {
+                const bus = yield* Bus.Service
+                yield* bus.subscribe([SessionEvent.Text.Delta, SessionEvent.Step.Ended]).pipe(
+                  Stream.filter((event) => event.data.sessionID === sessionID),
+                  Stream.runForEach((event) =>
+                    Effect.sync(() => {
+                      if (event.type === "session.step.ended") {
+                        // Mirrors ResearchResponse.text: only length-truncated steps continue into the reply.
+                        boundary = boundary || event.data.finish !== "length"
+                        return
+                      }
+                      progress?.({ type: "text", delta: event.data.delta, reset: boundary })
+                      boundary = false
+                    }),
+                  ),
+                )
+              }),
+            )
             await host.runtime
-              .runPromise(host.sessions.resume(Session.ID.make(sessionID)))
-              .finally(() => host.runtime.runPromise(Fiber.interrupt(watch)))
+              .runPromise(
+                // Resume joins an independently owned execution. Interrupt that execution as well
+                // as the waiter, so disconnects stop provider requests and database tools.
+                host.sessions.resume(Session.ID.make(sessionID)).pipe(
+                  Effect.onInterrupt(() =>
+                    host.sessions.interrupt(Session.ID.make(sessionID)).pipe(
+                      Effect.andThen(
+                        host.sessions.cancelInbox({ sessionID: Session.ID.make(sessionID), inboxID: admitted.id }).pipe(
+                          // Once promoted, the prompt is no longer in the inbox.
+                          Effect.catchTag("Session.InboxConflictError", () => Effect.void),
+                        ),
+                      ),
+                      Effect.ignore,
+                    ),
+                  ),
+                ),
+                { signal },
+              )
+              .finally(() => host.runtime.runPromise(Fiber.interruptAll([watch, live])))
+            signal?.throwIfAborted()
             const answer = await host.runtime.runPromise(state.latest(sessionID))
             const messages = await host.runtime.runPromise(
               host.sessions.messages({

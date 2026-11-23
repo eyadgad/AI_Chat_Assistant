@@ -6,6 +6,8 @@
   "packageManager": "bun@1.4.2",
   "license": "MIT",
   "scripts": {
+    "backend": "bun run backend/src/main.ts",
+    "test:backend": "bun test ./tests/backend/",
     "start": "bun run --preload ./frontend/preload.ts frontend/start.ts",
     "nia": "bun run start",
     "chat": "bun run start",
@@ -63,6 +65,10 @@
       "vite-plugin-solid": "2.11.10",
       "@lydell/node-pty": "1.2.0-beta.12"
     }
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.9",
+    "@electric-sql/pglite-socket": "0.2.12"
   },
   "trustedDependencies": [
     "esbuild",
